@@ -1,6 +1,6 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-use crate::{client::Client, net::{Message, ReliableOrderedNetwork, State, UnreliableNetwork}, sim::{Entity, Input}, ticktimer::TickTimer};
+use crate::{client::Client, net::{Message, State, UnreliableNetwork}, sim::{Entity, Input, World}, ticktimer::TickTimer};
 
 /// Represents networked server
 pub struct Server {
@@ -19,7 +19,12 @@ pub struct Server {
     connected_clients: HashMap<i32, Rc<RefCell<UnreliableNetwork>>>,
 
     // Server simulation data
-    entities: HashMap<i32, Entity>,
+    pub world: World,
+
+    npc_entities: Vec<i32>,
+
+    // Map of the network id to the local sim entity id
+    networked_players: HashMap<i32, i32>,
 
     // List of entities with their last tick rate that was integrated
     last_processed_input: HashMap<i32, i32>,
@@ -33,7 +38,9 @@ impl Server {
             tick_rate_ms,
             network: Rc::new(RefCell::new(UnreliableNetwork::new())),
             connected_clients: HashMap::new(),
-            entities: HashMap::new(),
+            world: World::new(),
+            npc_entities: Vec::new(),
+            networked_players: HashMap::new(),
             last_processed_input: HashMap::new(),
         }
     }
@@ -42,8 +49,28 @@ impl Server {
         Rc::clone(&self.network)
     }
 
-    pub fn get_entities(&self) -> Vec<&Entity> {
-        self.entities.values().collect()
+    pub fn create_npc_entities(&mut self) {
+        // Create non player entities
+        let mut entity = Entity::new();
+        entity.position = (100., 100.);
+        entity.colour = crate::sim::Colour::Blue;
+        let npc_id = self.world.add_entity(entity);
+
+        self.npc_entities.push(npc_id);
+    }
+
+    pub fn update_npc_entities(&mut self, tick: i32) {
+        for npc_id in self.npc_entities.iter() {
+            let entity = self.world.get_entity(*npc_id).unwrap();
+
+            // Move the npc entities in a circle
+            let ticks_ms = tick as f32 * self.tick_rate_ms as f32;
+            let angle = ticks_ms / 1000.0;
+            let new_x = entity.position.0 + angle.cos() * 5.0;
+            let new_y = entity.position.1 + angle.sin() * 5.0;
+
+            entity.position = (new_x, new_y);
+        }
     }
 
     // This is a function to fake connections on our fake network
@@ -59,19 +86,23 @@ impl Server {
         let mut entity = Entity::new();
         entity.position = (0., 0.);
         entity.colour = client.colour;
-        // We just give the entity same id as the client id
-        let new_id = client.get_id();
-        self.entities.insert(new_id, entity);
+        let entity_id = self.world.add_entity(entity);
+
+        // Store the network id to the entity id
+        self.networked_players.insert(client.get_id(), entity_id);
 
         // Return it for assignment
         // In real world this assignment would probably happen via a RPC
-        new_id
+        entity_id
     }
 
     pub fn update(&mut self) {
 
         // Fixed tickrate
         for tick in self.tick_timer.tick() {
+            //println!("Server tick: {}", tick);
+            self.update_npc_entities(tick);
+
             self.process_client_messages();
             self.broadcast_state(tick)
         }
@@ -82,7 +113,10 @@ impl Server {
         // Process all pending messages from clients
         while let Some((client_id, message)) = network.receive() {
             // Get the entity based on the one we're wanting to update
-            let entity = self.entities.get_mut(&client_id).unwrap();
+            // Look up the entity id based on the network id
+            let local_entity_id = self.networked_players.get(&client_id).unwrap();
+
+            let entity = self.world.get_entity(*local_entity_id).unwrap();
 
             // Integrate the client input from the message into the sim
             if let Some(input) = message.input {
@@ -104,32 +138,26 @@ impl Server {
         let mut world_state: Vec<State> = Vec::new();
 
         // Collect the state of all entities
-        // In this example we're working with just one entity per client
-        for (client_id, _client_network) in self.connected_clients.iter() {
-            // Use the client_id to get the entity
-            let entity = self.entities.get(client_id).unwrap();
-
-            // Get the last tick we processed input for this entity
-            let last_processed_tick = self.last_processed_input.get(client_id).unwrap_or(&0);
-
+        for (entity_id, entity) in self.world.get_entities() {
             let state = State {
-                tick: *last_processed_tick,
-                entity_id: *client_id,
+                entity_id: *entity_id,
                 position: entity.position,
                 colour: entity.colour,
             };
 
-            // Bundle up the state updates
             world_state.push(state);
         }
 
         // Broadcast the state to all connected clients
         // This might happen at a different rate than the tickrate
-        for (_client_id, client_network) in self.connected_clients.iter() {
+        for (client_id, client_network) in self.connected_clients.iter() {
+
+            let last_processed_tick = self.last_processed_input.get(client_id).unwrap_or(&0);
+
             let message = Message {
                 state: Some(world_state.clone()),
                 input: None, // Unused
-                sequence: tick, // Send the server tick so we know what state we're at
+                sequence: *last_processed_tick, // Send the server tick so we know what state we're at
             };
 
             let mut client_network = client_network.borrow_mut();

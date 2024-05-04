@@ -14,7 +14,6 @@ pub struct Message {
 
 #[derive(Default, Debug, Clone, Copy)]
 pub struct State {
-    pub tick: i32,
     pub entity_id: i32,
     pub position: (f32, f32),
     pub colour: Colour,

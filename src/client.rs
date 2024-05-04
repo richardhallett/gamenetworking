@@ -7,9 +7,9 @@ use std::{
 use macroquad::input::{is_key_down, KeyCode};
 
 use crate::{
-    net::{Message, ReliableOrderedNetwork, State, UnreliableNetwork},
+    net::{Message, State, UnreliableNetwork},
     server::Server,
-    sim::{Colour, Entity, Input},
+    sim::{Colour, Entity, Input, World},
     ticktimer::TickTimer,
 };
 
@@ -30,7 +30,9 @@ pub struct Client {
     server_network: Option<Rc<RefCell<UnreliableNetwork>>>,
 
     // Client simulation data
-    entities: HashMap<i32, Entity>,
+    pub world: World,
+
+    networked_entities: HashMap<i32, i32>,
 
     // The entity that the client controls
     controlled_entity: Option<i32>,
@@ -49,8 +51,9 @@ pub struct Client {
     pub server_reconciliation_enabled: bool,
 
     pub extrapolation_enabled: bool,
+
     // Stores the state snapshots from the server for use with extrapolation
-    pub state_snapshots: VecDeque<(i32, State)>,
+    pub state_snapshots: HashMap<i32, VecDeque<(i32, State)>>,
 
     pub use_alternate_input: bool,
     pub colour: Colour,
@@ -66,7 +69,8 @@ impl Client {
             tick_rate_ms,
             network: Rc::new(RefCell::new(UnreliableNetwork::new())),
             server_network: None,
-            entities: HashMap::new(),
+            world: World::new(),
+            networked_entities: HashMap::new(),
             controlled_entity: None,
             input_state: None,
             input_history: VecDeque::new(),
@@ -74,7 +78,7 @@ impl Client {
             client_prediction_enabled: true,
             server_reconciliation_enabled: true,
             extrapolation_enabled: true,
-            state_snapshots: VecDeque::new(),
+            state_snapshots: HashMap::new(),
             use_alternate_input: false,
             colour: Colour::Red,
             connected: false,
@@ -85,10 +89,6 @@ impl Client {
         self.id
     }
 
-    pub fn get_entities(&self) -> Vec<&Entity> {
-        self.entities.values().collect()
-    }
-
     pub fn get_network(&self) -> Rc<RefCell<UnreliableNetwork>> {
         Rc::clone(&self.network)
     }
@@ -97,8 +97,14 @@ impl Client {
     // up the network connection.
     // In the real world this would happen via network messages.
     // The client version sets its own controlled entity
-    pub fn connect(&mut self, server: &mut Server, min_latency_ms: u64, max_latency_ms: u64, drop_rate: f32) {
-        let client_entity_id = server.connect(self);
+    pub fn connect(
+        &mut self,
+        server: &mut Server,
+        min_latency_ms: u64,
+        max_latency_ms: u64,
+        drop_rate: f32,
+    ) {
+        let server_player_entity_id = server.connect(self);
         let server_network = server.get_network();
 
         // Set the same latency for both client and server
@@ -115,7 +121,17 @@ impl Client {
 
         // Set controlled entity to the entity we got from the server
         // As in server this probably would have happened over RPC assignment
-        self.controlled_entity = Some(client_entity_id);
+        // Create local entity for player
+        let entity = Entity {
+            position: (0., 0.),
+            speed: 5.0,
+            colour: self.colour,
+        };
+
+        let client_player_entity_id = self.world.add_entity(entity);
+        // Store the entity for later use
+        self.networked_entities.insert(server_player_entity_id, client_player_entity_id);
+        self.controlled_entity = Some(client_player_entity_id);
 
         self.connected = true;
     }
@@ -129,13 +145,9 @@ impl Client {
 
         // Fixed tickrate
         for tick in self.tick_timer.tick() {
+            //println!("Client tick: {}", tick);
             // Listen to the server and process server messages
             self.process_server_messages(tick);
-
-            // If we don't have a controlled entity we're not connected so don't do anything
-            if self.controlled_entity.is_none() {
-                continue;
-            }
 
             // Interpolate entities
             if self.extrapolation_enabled {
@@ -161,56 +173,62 @@ impl Client {
             // In this example entities represent the world state
             if let Some(world_state) = message.state {
                 for state in world_state {
-                    // If the entity in state update is not created locally then create
-                    if !self.entities.contains_key(&state.entity_id) {
-                        self.entities.insert(
-                            state.entity_id,
-                            Entity {
-                                position: state.position,
-                                speed: 5.0,
-                                colour: state.colour,
-                            },
-                        );
-                    }
+                    if let Some(client_entity_id) = self.networked_entities.get(&state.entity_id) {
+                        // Found locally, update entity
+                        let entity = self.world.get_entity(*client_entity_id).unwrap();
 
-                    // Get the entity from the message
-                    let entity = self.entities.get_mut(&state.entity_id).unwrap();
+                        if self
+                            .controlled_entity
+                            .is_some_and(|id| id == *client_entity_id)
+                        {
+                            // Set authoriative position to whatever server says
+                            entity.position = state.position;
 
-                    if self
-                        .controlled_entity
-                        .is_some_and(|id| id == state.entity_id)
-                    {
-                        // Set authoriative position to whatever server says
-                        entity.position = state.position;
+                            if self.server_reconciliation_enabled {
+                                // Reconciliation
+                                // We re-apply all inputs that the server hasn't processed yet
+                                // This is based on the last processed input tick
+                                // We need to reapply up to the latest current tick
+                                let last_sync_tick = message.sequence + 1;
 
-                        if self.server_reconciliation_enabled {
-                            // Reconciliation
-                            // We re-apply all inputs that the server hasn't processed yet
-                            // This is based on the last processed input tick
-                            // We need to reapply up to the latest current tick
-                            let last_sync_tick = state.tick + 1;
+                                // We only keep inputs that are newer than the last processed tick from server
+                                // So we're only removing stuff the server has already said it's processed
+                                self.input_history
+                                    .retain(|(input_tick, _)| *input_tick >= last_sync_tick);
 
-                            // We only keep inputs that are newer than the last processed tick from server
-                            // So we're only removing stuff the server has already said it's processed
-                            self.input_history
-                                .retain(|(input_tick, _)| *input_tick >= last_sync_tick);
-
-                            for (_input_tick, input) in &self.input_history {
-                                let entity = self.entities.get_mut(&state.entity_id).unwrap();
-                                entity.integrate_input(&input);
+                                for (_input_tick, input) in &self.input_history {
+                                    //let entity = self.world.entities.get_mut(&state.entity_id).unwrap();
+                                    entity.integrate_input(&input);
+                                }
+                            } else {
+                                // Disabled so drop all input history
+                                self.input_history.clear();
                             }
                         } else {
-                            // Disabled so drop all input history
-                            self.input_history.clear();
+                            if self.extrapolation_enabled {
+                                // Store the state for use with extrapolation
+                                self.state_snapshots
+                                    .entry(*client_entity_id)
+                                    .or_insert_with(VecDeque::new)
+                                    .push_back((tick, state));
+                            } else {
+                                // Extrapolation disabled so just set the position
+                                entity.position = state.position;
+                            }
                         }
                     } else {
-                        if self.extrapolation_enabled {
-                            // Store the state for use with extrapolation
-                            self.state_snapshots.push_back((tick, state));
-                        } else {
-                            // Extrapolation disabled so just set the position
-                            entity.position = state.position;
-                        }
+                        // Not found locally create entity
+                        let entity = Entity {
+                            position: state.position,
+                            speed: 5.0,
+                            colour: state.colour,
+                        };
+
+                        let client_entity_id = self.world.add_entity(entity);
+
+                        // Store the entity for later use
+                        self.networked_entities
+                            .insert(state.entity_id, client_entity_id);
                     }
                 }
             }
@@ -218,7 +236,7 @@ impl Client {
     }
 
     fn interpolate_entities(&mut self, tick: i32) {
-        for (entity_id, entity) in &mut self.entities {
+        for (entity_id, entity) in &mut self.world.get_entities_mut().iter_mut() {
             // Smoothing value
             let smoothing_rate = 10;
 
@@ -227,43 +245,52 @@ impl Client {
 
             // Ignore the controlled entity
             if self.controlled_entity.is_some_and(|id| id == *entity_id) {
+                //println!("Ignoring controlled entity {}", entity_id);
                 continue;
             }
 
-            // Interpolate between the two latest snapshots
-            if self.state_snapshots.len() >= 2 {
-                // Drop the older snapshots
-                while let Some((snapshot_tick, _)) = self.state_snapshots.get(1) {
-                    if self.state_snapshots.len() >= 2 && *snapshot_tick <= render_tick {
-                        self.state_snapshots.pop_front();
-                    } else {
-                        break;
+            // If we have more than 2 snapshots keep the latest 2
+            self.state_snapshots
+                .entry(*entity_id)
+                .and_modify(|snapshots| {
+                    if snapshots.len() > 2 && snapshots[1].0 <= render_tick {
+                        snapshots.pop_front();
                     }
-                }
+                });
 
-                if let Some((snapshot1_tick, snapshot1_state)) = self.state_snapshots.get(0) {
-                    if let Some((snapshot2_tick, snapshot2_state)) = self.state_snapshots.get(1) {
+            // If we have a snapshot for this entity
+            if let Some(snapshots) = self.state_snapshots.get(entity_id) {
+                 // Interpolate between the two latest snapshots
+                 if snapshots.len() >= 2 {
+                    // Drop the older snapshots
+                    // while let Some((snapshot_tick, _)) = snapshots.get(1) {
+                    //     if snapshots.len() >= 2 && *snapshot_tick <= render_tick {
+                    //         snapshots.pop_front();
+                    //     } else {
+                    //         break;
+                    //     }
+                    // }
 
-                        if snapshot1_tick <= &render_tick && snapshot2_tick >= &render_tick {
-                            let x0 = snapshot1_state.position.0;
-                            let x1 = snapshot2_state.position.0;
-                            let y0 = snapshot1_state.position.1;
-                            let y1 = snapshot2_state.position.1;
+                    if let Some((snapshot1_tick, snapshot1_state)) = snapshots.get(0) {
+                        if let Some((snapshot2_tick, snapshot2_state)) = snapshots.get(1) {
+                            if snapshot1_tick <= &render_tick && snapshot2_tick >= &render_tick {
+                                let x0 = snapshot1_state.position.0;
+                                let x1 = snapshot2_state.position.0;
+                                let y0 = snapshot1_state.position.1;
+                                let y1 = snapshot2_state.position.1;
 
-                            let t0 = snapshot1_tick;
-                            let t1 = snapshot2_tick;
+                                let t0 = snapshot1_tick;
+                                let t1 = snapshot2_tick;
 
-                            // Difference between the two snapshots
-                            let delta = t1 - t0;
-                            let time_since_snapshot = render_tick - t0;
-                            let lerp_fac = time_since_snapshot as f32 / delta as f32;
+                                // Difference between the two snapshots
+                                let delta = t1 - t0;
+                                let time_since_snapshot = render_tick - t0;
+                                let lerp_fac = time_since_snapshot as f32 / delta as f32;
 
-                            let position = (
-                                x0 + (x1 - x0) * lerp_fac,
-                                y0 + (y1 - y0) * lerp_fac,
-                            );
+                                let position = (x0 + (x1 - x0) * lerp_fac, y0 + (y1 - y0) * lerp_fac);
 
-                            entity.position = position;
+                                entity.position = position;
+                            }
                         }
                     }
                 }
@@ -327,7 +354,11 @@ impl Client {
                 // Client side prediction
                 // We let the client carry out it's local simulation changes
                 if self.client_prediction_enabled {
-                    if let Some(entity) = self.entities.get_mut(&self.controlled_entity.unwrap()) {
+                    let controlled_client_entity_id = self.controlled_entity.unwrap();
+                    if let Some(entity) = self
+                        .world
+                        .get_entity(controlled_client_entity_id)
+                    {
                         entity.integrate_input(&input_state);
                     }
                 }

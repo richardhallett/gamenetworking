@@ -71,7 +71,7 @@ fn draw_client(client: &Client) {
         WHITE,
     );
 
-    draw_entities(client.get_entities());
+    draw_entities(client.world.get_entities().values().collect());
 }
 
 fn draw_server(server: &server::Server) {
@@ -86,7 +86,7 @@ fn draw_server(server: &server::Server) {
         WHITE,
     );
 
-    draw_entities(server.get_entities());
+    draw_entities(server.world.get_entities().values().collect());
 }
 
 fn draw_entities(entities: Vec<&Entity>) {
@@ -94,6 +94,7 @@ fn draw_entities(entities: Vec<&Entity>) {
         let macroquad_colour = match entity.colour {
             sim::Colour::Red => RED,
             sim::Colour::Green => GREEN,
+            sim::Colour::Blue => BLUE,
         };
 
         draw_rectangle(
@@ -184,7 +185,7 @@ struct UIState {
 
 #[macroquad::main("Fast GameNetworking Example")]
 async fn main() {
-    let mut server = server::Server::new(100);
+    let mut server = server::Server::new(50);
     let mut client1 = Client::new(1, 16);
     let mut client2 = Client::new(2, 16);
 
@@ -206,6 +207,11 @@ async fn main() {
     };
 
     let mut pause_client_1 = false;
+
+    client1.connect(&mut server, 250, 250, 0.);
+    client2.connect(&mut server, 100, 100, 0.);
+
+    server.create_npc_entities();
 
     loop {
         let grid_section_width = screen_width() / 2.;
